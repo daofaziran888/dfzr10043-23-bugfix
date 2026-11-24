@@ -33,11 +33,15 @@ def is_dirty_row(row: dict[str, Any], required_fields: list[str]) -> bool:
 
 def dedup_by_window(rows: list[dict[str, Any]], key_fields: list[str],
                     window_days: int = 1) -> list[dict[str, Any]]:
-    """按采集窗口去重：相同时窗口内相同键字段的重复行只保留第一条。"""
+    """按采集窗口去重：相同时窗口内相同键字段的重复行只保留第一条。
+
+    窗口按行自身时间划入固定跨度的时间桶（window_days 天为一桶），
+    与当前时刻无关；窗口之外的行各自成桶，不会被误丢。
+    """
     seen: set[str] = set()
     result = []
     tz = timezone(timedelta(hours=8))
-    now = datetime.now(tz)
+    window_seconds = max(1, window_days) * 86400
     for row in rows:
         key = "|".join(str(row.get(f, "")) for f in key_fields)
         gen_time = row.get("生成时间", "") or row.get("入队时间", "") or ""
@@ -45,11 +49,12 @@ def dedup_by_window(rows: list[dict[str, Any]], key_fields: list[str],
             row_dt = datetime.fromisoformat(gen_time)
             if row_dt.tzinfo is None:
                 row_dt = row_dt.replace(tzinfo=tz)
+            bucket = str(int(row_dt.timestamp()) // window_seconds)
         except (ValueError, TypeError):
-            row_dt = now
-        in_window = abs((now - row_dt).days) <= window_days
-        if key not in seen and in_window:
-            seen.add(key)
+            bucket = ""
+        dedup_key = f"{bucket}|{key}"
+        if dedup_key not in seen:
+            seen.add(dedup_key)
             result.append(row)
     return result
 

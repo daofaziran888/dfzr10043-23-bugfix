@@ -79,6 +79,171 @@ class TestPipelineLink1_PublishScheduleDispatch:
         assert trace.get("退出码") == "0"
 
 
+class TestScheduleExpiryExpiredDispatchLinkage:
+    """排程生效判断与投递联动：过期拒绝、生效清单核对、重复提交判重。"""
+
+    def _first_template_id(self) -> int:
+        tpl_svc = service_for("flow_template")
+        return tpl_svc.list_entries()[0][0].get("id")
+
+    def test_expired_plan_rejected_and_not_left_active(self):
+        """止日为2000-01-01的旧计划触发拒绝后，不再残留为生效状态。"""
+        plan_svc = service_for("schedule_plan")
+        tpl_id = self._first_template_id()
+        result = publish_flow_and_schedule(tpl_id, {
+            "计划编号": "SCHE-OLD-2000",
+            "触发周期": "daily",
+            "生效止日": "2000-01-01",
+        })
+        assert result["status"] == "rejected"
+        plan = plan_svc.get_entry(result["plan_id"])
+        assert plan["status"] == "已过期"
+        # 生效清单中读不到这个不可派窗口
+        assert all(p.get("计划编号") != "SCHE-OLD-2000" for p in plan_svc.get_active_plans())
+
+    def test_rejection_reason_traceable_by_plan_code(self):
+        """旧投递被拒后可按计划编号回查拒绝依据。"""
+        plan_svc = service_for("schedule_plan")
+        tpl_id = self._first_template_id()
+        publish_flow_and_schedule(tpl_id, {
+            "计划编号": "SCHE-OLD-TRACE",
+            "触发周期": "daily",
+            "生效止日": "2000-01-01",
+        })
+        plan = plan_svc.find_by_plan_code("SCHE-OLD-TRACE")
+        assert plan is not None
+        assert "已过期" in plan.get("拒绝原因", "")
+        assert "迟到数据" in plan.get("拒绝原因", "")
+
+    def test_rejection_does_not_rollback_confirmed_template(self):
+        """拒绝回报不得让已确认的新数据回退：模板保持已发布。"""
+        tpl_svc = service_for("flow_template")
+        tpl_id = self._first_template_id()
+        result = publish_flow_and_schedule(tpl_id, {
+            "计划编号": "SCHE-OLD-NOROLLBACK",
+            "触发周期": "daily",
+            "生效止日": "2000-01-01",
+        })
+        assert result["status"] == "rejected"
+        assert tpl_svc.get_entry(tpl_id)["status"] == "已发布"
+
+    def test_expired_plan_never_enters_active_list_mid_process(self):
+        """旧计划入账后、派发处理完成前读生效清单，也读不到该窗口。"""
+        plan_svc = service_for("schedule_plan")
+        entry, _ = plan_svc.create_entry({
+            "计划编号": "SCHE-OLD-MID",
+            "关联模板": "FLOW-0001",
+            "触发周期": "daily",
+            "生效止日": "2000-01-01",
+        })
+        # 入账（待生效）状态下立即读生效清单
+        assert all(p.get("计划编号") != "SCHE-OLD-MID" for p in plan_svc.get_active_plans())
+        # 迟到检查返回拒绝后仍不在生效清单
+        late = plan_svc.check_late_arrival(entry["id"])
+        assert late["late"] is True
+        assert all(p.get("计划编号") != "SCHE-OLD-MID" for p in plan_svc.get_active_plans())
+
+    def test_late_redelivery_terminates_stale_active_plan(self):
+        """同模板老计划已过期，迟到的旧触发重投报错后不再显示生效。"""
+        plan_svc = service_for("schedule_plan")
+        entry, _ = plan_svc.create_entry({
+            "计划编号": "SCHE-OLD-LATE",
+            "关联模板": "FLOW-0001",
+            "触发周期": "daily",
+            "生效止日": "2000-01-01",
+        })
+        plan_svc.run_action(entry["id"], "启效排程")  # 历史错误生效记录
+        result = plan_svc.check_late_arrival(entry["id"])
+        assert result["late"] is True
+        assert plan_svc.get_entry(entry["id"])["status"] == "已过期"
+
+    def test_erroneous_active_record_reconciled_and_valid_plan_still_works(self):
+        """历史存在错误生效记录时，仍可通过有效排程处理真实缺采日。"""
+        plan_svc = service_for("schedule_plan")
+        stale, _ = plan_svc.create_entry({
+            "计划编号": "SCHE-OLD-DIRTY",
+            "关联模板": "FLOW-0001",
+            "触发周期": "daily",
+            "生效止日": "2000-01-01",
+        })
+        plan_svc.run_action(stale["id"], "启效排程")  # 历史错误生效记录
+        active = plan_svc.get_active_plans()
+        assert all(p.get("计划编号") != "SCHE-OLD-DIRTY" for p in active)
+        assert plan_svc.get_entry(stale["id"])["status"] == "已过期"
+        # 同模板有效计划补采真实缺采日，正常派发
+        tpl_id = self._first_template_id()
+        result = publish_flow_and_schedule(tpl_id, {
+            "计划编号": "SCHE-NEW-BACKFILL",
+            "触发周期": "daily",
+            "生效止日": "2099-12-31",
+        })
+        assert result["status"] == "dispatched"
+
+    def test_duplicate_plan_code_dispatches_only_once(self):
+        """同时提交相同新计划只允许派一次，且已确认数据不回退。"""
+        queue_svc = service_for("task_queue")
+        tpl_id = self._first_template_id()
+        before = len(queue_svc.list_entries(size=10000)[0])
+        first = publish_flow_and_schedule(tpl_id, {
+            "计划编号": "SCHE-NEW-ONCE",
+            "触发周期": "daily",
+        })
+        second = publish_flow_and_schedule(tpl_id, {
+            "计划编号": "SCHE-NEW-ONCE",
+            "触发周期": "daily",
+        })
+        assert first["status"] == "dispatched"
+        assert second["status"] == "duplicate"
+        after = len(queue_svc.list_entries(size=10000)[0])
+        assert after - before == 1  # 只入账一条排队任务
+        # 第一次派发的任务保持已派发，未被拒绝回报回退
+        task = queue_svc.get_entry(first["task_id"])
+        assert task["status"] == "已派发"
+
+    def test_redispatch_from_active_list_honors_range_once(self):
+        """重新打开生效清单继续派发时，合法范围只兑现一次。"""
+        plan_svc = service_for("schedule_plan")
+        tpl_id = self._first_template_id()
+        publish_flow_and_schedule(tpl_id, {
+            "计划编号": "SCHE-NEW-RANGE",
+            "触发周期": "daily",
+        })
+        # 重新打开生效清单，按清单中的计划编号再次投递
+        for plan in plan_svc.get_active_plans():
+            if plan.get("计划编号") == "SCHE-NEW-RANGE":
+                again = publish_flow_and_schedule(tpl_id, {
+                    "计划编号": plan["计划编号"],
+                    "触发周期": "daily",
+                })
+                assert again["status"] == "duplicate"
+
+    def test_queue_excludes_task_from_expired_source_plan(self):
+        """补采队列与生效清单共用核对结果：来源计划过期的任务不可派。"""
+        plan_svc = service_for("schedule_plan")
+        queue_svc = service_for("task_queue")
+        stale, _ = plan_svc.create_entry({
+            "计划编号": "SCHE-OLD-QUEUE",
+            "关联模板": "FLOW-0001",
+            "触发周期": "daily",
+            "生效止日": "2000-01-01",
+        })
+        plan_svc.run_action(stale["id"], "启效排程")  # 历史错误生效记录
+        task, _ = queue_svc.create_entry({
+            "队列编号": "TASK-OLD-QUEUE",
+            "关联模板": "FLOW-0001",
+            "优先级": "high",
+        })
+        task["来源计划"] = "SCHE-OLD-QUEUE"
+        # 不进可派队列
+        assert all(t.get("队列编号") != "TASK-OLD-QUEUE"
+                   for t in queue_svc.get_pending_by_priority())
+        # 直接派发也被拒
+        result = queue_svc.dispatch_to_node(task["id"], "ROBO-0002")
+        assert result["ok"] is False
+        # 来源计划的拒绝依据可回查
+        assert "迟到数据" in plan_svc.find_by_plan_code("SCHE-OLD-QUEUE").get("拒绝原因", "")
+
+
 class TestPipelineLink2_CollectLandHandoff:
     """链路2: 文件归集校验→采集批次→字段映射→数据落库→交接包"""
 

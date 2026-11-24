@@ -24,6 +24,7 @@ from collections import Counter
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable
 
+from app.dedup import is_late_arrival
 from app.services import service_for
 
 # ── 通用工具 ──────────────────────────────────────────────────
@@ -59,10 +60,24 @@ def publish_flow_and_schedule(template_id: int, plan_payload: dict[str, Any]) ->
     tpl_svc.run_action(template_id, "发布模板")
     template = tpl_svc.get_entry(template_id)
 
-    # 创建排程计划
     plan_svc = service_for("schedule_plan")
+    plan_code = plan_payload.get("计划编号", f"SCHE-A{template_id}")
+
+    # 重复提交防护：相同计划编号只允许入账并派发一次。
+    # 重复提交只返回拒绝回报，不回退已确认的新数据（模板发布、已派任务等）。
+    existing = plan_svc.find_by_plan_code(plan_code)
+    if existing is not None:
+        return {
+            "status": "duplicate",
+            "reason": (f"计划编号{plan_code}已存在（状态：{existing.get('status')}），"
+                       f"相同计划只允许派一次"),
+            "plan_id": existing["id"],
+            "计划编号": plan_code,
+        }
+
+    # 创建排程计划
     plan_values = {
-        "计划编号": plan_payload.get("计划编号", f"SCHE-A{template_id}"),
+        "计划编号": plan_code,
         "关联模板": template.get("模板编号", ""),
         "触发周期": plan_payload.get("触发周期", "daily"),
         "时区设定": plan_payload.get("时区设定", "Asia/Shanghai"),
@@ -72,14 +87,23 @@ def publish_flow_and_schedule(template_id: int, plan_payload: dict[str, Any]) ->
         "下次触发": plan_payload.get("下次触发", _now_iso()),
     }
     plan_result, _ = plan_svc.create_entry(plan_values)
+
+    # 迟到数据防护：先做采集窗口核对再启效。过期排程直接终止并记录拒绝原因，
+    # 全程不进入生效清单、不投递任务队列，拒绝依据可按计划编号回查。
+    stop_date = plan_values.get("生效止日", "")
+    if stop_date and is_late_arrival(stop_date):
+        plan_entry = plan_svc.get_entry(plan_result["id"])
+        reason = plan_svc.reject_expired_plan(plan_entry, stop_date)
+        return {
+            "status": "rejected",
+            "reason": f"{reason}，不投递任务队列",
+            "plan_id": plan_result["id"],
+            "计划编号": plan_code,
+        }
+
     plan_svc.run_action(plan_result["id"], "启效排程")
 
-    # 迟到数据防护：生效止日已过则拒绝投递
-    stop_date = plan_values.get("生效止日", "")
-    if stop_date < _now_iso()[:10]:
-        return {"status": "rejected", "reason": "排程已过期（迟到数据），不投递任务队列"}
-
-    # 投递到任务队列
+    # 投递到任务队列（标注来源计划，供队列侧与排程生效判断联动核对）
     queue_svc = service_for("task_queue")
     queue_values = {
         "队列编号": f"TASK-P{template_id}",
@@ -90,6 +114,7 @@ def publish_flow_and_schedule(template_id: int, plan_payload: dict[str, Any]) ->
         "占用节点": "",
         "等待秒数": "0",
         "入队时间": _now_iso(),
+        "来源计划": plan_code,
     }
     task_result, _ = queue_svc.create_entry(queue_values)
 

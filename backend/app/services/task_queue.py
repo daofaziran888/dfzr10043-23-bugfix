@@ -26,10 +26,32 @@ class TaskQueueService(BaseModuleService):
 
     _PRIORITY_WEIGHTS = {"high": 3, "medium": 2, "low": 1}
 
+    def _source_plan_dispatchable(self, task: dict[str, Any]) -> bool:
+        """与排程生效判断联动：核对任务来源排程的采集窗口。
+
+        来源排程已过期（或不在生效清单）的任务不可派；未标注来源的
+        任务无法核对，按可派处理。
+        """
+        plan_code = str(task.get("来源计划", "") or "")
+        if not plan_code:
+            return True
+        from app.services import service_for  # 延迟导入，避免服务注册表循环依赖
+        plan_svc = service_for("schedule_plan")
+        if plan_svc is None or not hasattr(plan_svc, "is_plan_dispatchable"):
+            return True
+        return bool(plan_svc.is_plan_dispatchable(plan_code))
+
     def get_pending_by_priority(self) -> list[dict[str, Any]]:
-        """按优先级排序返回待派发任务。"""
+        """按优先级排序返回待派发任务（补采队列）。
+
+        与排程生效清单共用采集窗口核对结果：来源排程已过期的任务
+        不进可派队列，不占用合法计划的可派范围。
+        """
         items, _ = self.list_entries(size=10000)
-        pending = [it for it in items if it.get("status") == "待派发"]
+        pending = [
+            it for it in items
+            if it.get("status") == "待派发" and self._source_plan_dispatchable(it)
+        ]
         pending.sort(
             key=lambda t: self._PRIORITY_WEIGHTS.get(
                 str(t.get("优先级", "low")).lower(), 1
@@ -49,12 +71,17 @@ class TaskQueueService(BaseModuleService):
         return {"ok": True, "recycled_count": recycled}
 
     def dispatch_to_node(self, task_id: int, node_code: str) -> dict[str, Any]:
-        """将任务派发到指定节点。"""
+        """将任务派发到指定节点。来源排程已过期的任务拒绝派发。"""
         entry = self.get_entry(task_id)
         if entry is None:
             return {"ok": False, "reason": "任务不存在"}
         if entry.get("status") != "待派发":
             return {"ok": False, "reason": "任务状态不是待派发"}
+        if not self._source_plan_dispatchable(entry):
+            return {
+                "ok": False,
+                "reason": f"来源排程{entry.get('来源计划')}已过期，不在生效清单，拒绝派发",
+            }
         entry["占用节点"] = node_code
         self.run_action(task_id, "派发任务")
         return {"ok": True, "task_id": task_id, "node": node_code}
